@@ -1,12 +1,19 @@
 package custosummary
 
 import (
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"go.k6.io/k6/js/modules"
+	"go.k6.io/k6/metrics"
 	"go.k6.io/k6/output"
+
+	"github.com/joanlopez/xk6-custosummary/report"
+	"github.com/joanlopez/xk6-custosummary/summary"
+	"github.com/joanlopez/xk6-custosummary/timeseries"
 )
 
 // TODO: Parameterize
@@ -16,7 +23,10 @@ const (
 
 func init() {
 	// Initialize the global RootModule instance accessor.
-	root := &RootModule{}
+	root := &RootModule{
+		Collection: timeseries.NewCollection(),
+	}
+
 	New = func() *RootModule { return root }
 
 	// Register the extension as a k6 module.
@@ -30,25 +40,22 @@ type (
 	// RootModule is the global module instance that will create module
 	// instances for each VU.
 	RootModule struct {
+		params output.Params
+
+		start time.Time
+		timeseries.Collection
+
 		output.SampleBuffer
 		periodicFlusher *output.PeriodicFlusher
 		logger          logrus.FieldLogger
 	}
-
-	// ModuleInstance represents an instance of the JS module.
-	ModuleInstance struct {
-		vu   modules.VU
-		root *RootModule
-	}
 )
 
 // Ensure the interfaces are implemented correctly.
-var (
-	_ output.WithStopWithTestError = &RootModule{}
-
-	_ modules.Module   = &RootModule{}
-	_ modules.Instance = &ModuleInstance{}
-)
+var _ interface {
+	modules.Module
+	output.WithStopWithTestError
+} = &RootModule{}
 
 // New returns a pointer to a new RootModule instance.
 var New func() *RootModule
@@ -57,6 +64,7 @@ var New func() *RootModule
 // and returns (the same) output.Output instance.
 func NewOutput(params output.Params) (output.Output, error) {
 	root := New()
+	root.params = params
 	root.logger = params.Logger
 	return root, nil
 }
@@ -84,6 +92,7 @@ func (rm *RootModule) Start() error {
 	}
 
 	rm.logger.Debug("Started!")
+	rm.start = time.Now()
 	rm.periodicFlusher = pf
 
 	return nil
@@ -96,6 +105,11 @@ func (rm *RootModule) StopWithTestError(err error) error {
 	defer rm.logger.Debug("Stopped!")
 
 	rm.periodicFlusher.Stop()
+
+	r := report.From(rm.Collection, time.Since(rm.start), rm.params.ScriptOptions)
+	s := summary.From(r, rm.params.ScriptOptions)
+	_, _ = fmt.Fprintln(os.Stdout) // FIXME: Handle error.
+	_, _ = s.WriteTo(os.Stdout)    // FIXME: Handle error.
 
 	return nil
 }
@@ -114,10 +128,20 @@ func (rm *RootModule) loggerWithError(err error) logrus.FieldLogger {
 }
 
 func (rm *RootModule) flushMetrics() {
-	rm.logger.Infoln("Flushing metrics...")
+	samples := rm.GetBufferedSamples()
+	for _, sc := range samples {
+		samples := sc.GetSamples()
+		for _, sample := range samples {
+			rm.flushSample(sample)
+		}
+	}
 }
 
-// Exports implements the output.Output interface, by returning the module's (ESM) exports.
-func (m ModuleInstance) Exports() modules.Exports {
-	return modules.Exports{}
+func (rm *RootModule) flushSample(s metrics.Sample) {
+	// We register the metric and its sub-metrics,
+	// and we add the sample value to their sinks.
+	rm.AddSample(s)
+	for _, sub := range s.Metric.Submetrics {
+		rm.AddMetricSample(sub.Metric, s)
+	}
 }
